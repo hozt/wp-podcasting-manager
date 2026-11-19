@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  phpunit:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mysqli, curl, mbstring, xml, zip
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress
+
+      - name: Install WordPress test core
+        run: bash tests/bin/install-wordpress.sh
+
+      - name: Run PHPUnit
+        run: vendor/bin/phpunit
+        env:
+          PODCAST_TEST_DB_HOST: 127.0.0.1
+          PODCAST_TEST_DB_SOCKET: ''
+          PODCAST_TEST_DB_NAME: wordpress_test
+          PODCAST_TEST_DB_USER: root
+          PODCAST_TEST_DB_PASSWORD: root

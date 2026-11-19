@@ -1,0 +1,17 @@
+{
+    "name": "hozt/podcasting-manager",
+    "description": "Manage podcasts with admin interface, GraphQL support and a Podcasting 2.0 RSS feed.",
+    "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
+    "require-dev": {
+        "phpunit/phpunit": "^9.6",
+        "wp-phpunit/wp-phpunit": "^7.1",
+        "yoast/phpunit-polyfills": "^4.0"
+    },
+    "config": {
+        "allow-plugins": {}
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit"
+    }
+}

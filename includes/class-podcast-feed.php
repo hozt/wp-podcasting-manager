@@ -14,6 +14,39 @@ class PodcastingManagerFeed {
         add_action('pre_get_posts', [$this, 'limit_feed_query']);
         add_action('wp_head', [$this, 'print_alternate_link']);
         add_filter('post_type_archive_feed_link', [$this, 'archive_feed_link'], 10, 2);
+        // Anything that can change the feed output invalidates the cached copy.
+        add_action('save_post_podcast', [$this, 'bust_cache']);
+        add_action('transition_post_status', [$this, 'bust_cache_for_transition'], 10, 3);
+        add_action('deleted_post', [$this, 'bust_cache_for_post']);
+        add_action('updated_post_meta', [$this, 'bust_cache_for_meta'], 10, 3);
+        add_action('added_post_meta', [$this, 'bust_cache_for_meta'], 10, 3);
+        add_action('updated_option', [$this, 'bust_cache_for_option']);
+        add_action('added_option', [$this, 'bust_cache_for_option']);
+    }
+
+    const CACHE_VERSION_OPTION = 'podcast_feed_cache_version';
+
+    public function bust_cache() {
+        update_option(self::CACHE_VERSION_OPTION, microtime(true), false);
+    }
+
+    public function bust_cache_for_transition($new, $old, $post) {
+        if ($post && $post->post_type === 'podcast' && $new !== $old) $this->bust_cache();
+    }
+
+    public function bust_cache_for_post($post_id) {
+        if (get_post_type($post_id) === 'podcast') $this->bust_cache();
+    }
+
+    /** Only episode fields the feed actually prints (not _edit_lock and friends). */
+    public function bust_cache_for_meta($meta_id, $post_id, $meta_key) {
+        static $keys = ['_mp3_file', '_mp3_attachment_id', '_episode_number', '_season_number', '_episode_date', '_episode_length', '_file_size',
+                        '_transcript_url', '_transcript_type', '_chapters_url', '_episode_hosts', '_episode_guests', '_thumbnail_id'];
+        if (in_array($meta_key, $keys, true) && get_post_type($post_id) === 'podcast') $this->bust_cache();
+    }
+
+    public function bust_cache_for_option($option) {
+        if (is_string($option) && strpos($option, 'podcast_') === 0 && $option !== self::CACHE_VERSION_OPTION && $option !== 'podcast_flush_rewrite') $this->bust_cache();
     }
 
     public function register_feed() {
@@ -40,12 +73,24 @@ class PodcastingManagerFeed {
         if (!$query->is_main_query() || !$query->is_feed('podcast')) return;
         $query->set('post_type', 'podcast');
         $query->set('post_status', 'publish');
-        $query->set('posts_per_page', max(1, (int) get_option('podcast_feed_limit', 20)));
+        $query->set('has_password', false); // password-protected episodes must not appear in a public feed
+        // NB: feeds ignore posts_per_page — WP_Query::get_posts() overwrites it with
+        // posts_per_rss after pre_get_posts, so the feed limit must go there.
+        $query->set('posts_per_rss', max(1, (int) get_option('podcast_feed_limit', 20)));
         $query->set('meta_query', [[
             'key'     => '_mp3_file',
             'value'   => '',
             'compare' => '!=',
         ]]);
+        // Order (and cut off the limit) by episode date so backdated episodes land where their pubDate says.
+        add_filter('posts_clauses', function ($clauses, $q) use ($query) {
+            if ($q !== $query) return $clauses;
+            global $wpdb;
+            $clauses['join'] .= " LEFT JOIN {$wpdb->postmeta} AS pm_epdate ON (pm_epdate.post_id = {$wpdb->posts}.ID AND pm_epdate.meta_key = '_episode_date')";
+            $clauses['orderby'] = "COALESCE(NULLIF(pm_epdate.meta_value, ''), DATE({$wpdb->posts}.post_date)) DESC, {$wpdb->posts}.ID DESC";
+            if ($clauses['groupby'] === '') $clauses['groupby'] = "{$wpdb->posts}.ID";
+            return $clauses;
+        }, 10, 2);
     }
 
     /** Stable podcast:guid — UUIDv5 of the feed URL (sans scheme), stored once. */
@@ -113,6 +158,29 @@ class PodcastingManagerFeed {
     }
 
     public function render_feed() {
+        global $wp_query;
+        $cacheable = !$wp_query->is_paged() && !$wp_query->is_search();
+        $key  = 'podcast_feed_' . md5((string) get_option(self::CACHE_VERSION_OPTION, '0'));
+        $body = $cacheable ? get_transient($key) : false;
+        if ($body === false) {
+            ob_start();
+            $this->output_feed();
+            $body = ob_get_clean();
+            if ($cacheable) set_transient($key, $body, HOUR_IN_SECONDS);
+        }
+
+        $etag = '"' . md5($body) . '"';
+        header('Content-Type: application/rss+xml; charset=' . get_option('blog_charset'), true);
+        header('Cache-Control: public, max-age=300');
+        header('ETag: ' . $etag);
+        if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim(wp_unslash($_SERVER['HTTP_IF_NONE_MATCH'])) === $etag) {
+            status_header(304);
+            return;
+        }
+        echo $body; // phpcs:ignore WordPress.Security.EscapeOutput -- escaped while building the feed
+    }
+
+    private function output_feed() {
         $opt      = fn($k) => (string) get_option($k);
         $title    = $opt('podcast_name') ?: get_bloginfo('name');
         $desc     = wp_strip_all_tags($opt('podcast_description')) ?: get_bloginfo('description');
@@ -127,7 +195,6 @@ class PodcastingManagerFeed {
         $latest = 0;
         foreach ($wp_query->posts as $p) $latest = max($latest, self::item_timestamp($p));
 
-        header('Content-Type: application/rss+xml; charset=' . get_option('blog_charset'), true);
         echo '<?xml version="1.0" encoding="' . esc_attr(get_option('blog_charset')) . '"?>' . "\n";
         ?>
 <rss version="2.0"
@@ -215,6 +282,9 @@ class PodcastingManagerFeed {
         $meta    = fn($k) => (string) get_post_meta($id, $k, true);
         $mp3     = $meta('_mp3_file');
         $size    = (int) $meta('_file_size');
+        if (!$size && ($att = (int) $meta('_mp3_attachment_id')) && ($file = get_attached_file($att)) && is_readable($file)) {
+            $size = (int) filesize($file); // enclosure length is required; fall back to the attached file's size
+        }
         $length  = (int) $meta('_episode_length');
         $number  = (int) $meta('_episode_number');
         $season  = (int) $meta('_season_number');

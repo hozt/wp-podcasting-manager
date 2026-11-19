@@ -43,6 +43,17 @@ class PodcastingManagerOptions {
         ];
     }
 
+    /** MIME type => label for transcript files. */
+    public static function transcript_types() {
+        return ['text/html' => 'HTML', 'text/plain' => 'Plain text', 'application/srt' => 'SRT', 'text/vtt' => 'WebVTT', 'application/json' => 'JSON'];
+    }
+
+    /** Slugs the episode archive must not use (they would shadow core routes). */
+    public static function reserved_slugs() {
+        return ['wp-admin', 'wp-content', 'wp-includes', 'wp-json', 'wp-login', 'feed', 'rss', 'rss2', 'rdf', 'atom', 'page', 'comments',
+                'embed', 'search', 'author', 'category', 'tag', 'attachment', 'trackback', 'xmlrpc', 'admin', 'login'];
+    }
+
     public static function explicit_ratings() {
         return [
             'no'  => 'Clean — suitable for all audiences',
@@ -98,6 +109,7 @@ class PodcastingManagerOptions {
         $valid = self::valid_categories();
         $clean = [];
         foreach ($items as $item) {
+            if (!is_string($item)) continue;
             $item = trim(wp_unslash($item));
             if ($item !== '' && in_array($item, $valid, true) && !in_array($item, $clean, true)) $clean[] = $item;
         }
@@ -105,6 +117,6 @@ class PodcastingManagerOptions {
     }
 
     public static function sanitize_choice($choices) {
-        return fn($v) => array_key_exists($v, $choices) ? $v : '';
+        return fn($v) => is_string($v) && array_key_exists($v, $choices) ? $v : '';
     }
 }

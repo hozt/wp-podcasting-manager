@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Podcasting Manager
  * Description: Manage podcasts with admin interface, GraphQL support and a Podcasting 2.0 RSS feed.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      Jeffrey Haug
  * Author URI:  https://hozt.com
  */
@@ -20,10 +20,16 @@ class PodcastingManager {
         add_action('init', [$this, 'register_post_type']);
         add_action('add_meta_boxes', [$this, 'add_meta_boxes']);
         add_action('save_post', [$this, 'save_meta_box_data']);
+        add_action('save_post_podcast', [$this, 'reset_number_owners']);
+        add_action('transition_post_status', [$this, 'reset_number_owners']);
         add_action('graphql_register_types', [$this, 'register_graphql_fields']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_scripts']);
         add_filter('query_vars', fn($v) => array_merge($v, ['episode_number']));
         add_action('pre_get_posts', [$this, 'query_by_episode_number']);
+        add_action('pre_get_posts', [$this, 'archive_query']);
+        add_filter('template_include', [$this, 'archive_template']);
+        add_action('init', [$this, 'maybe_flush_rewrite'], 99);
+        add_action('loop_start', [$this, 'breadcrumbs_before_loop']);
         add_filter('the_content', [$this, 'prepend_player']);
         add_shortcode('podcast_episodes', [$this, 'episodes_shortcode']);
         add_filter('post_type_link', [$this, 'episode_permalink'], 10, 2);
@@ -63,22 +69,7 @@ class PodcastingManager {
         $out = '<div class="podcast-episodes">';
         while ($q->have_posts()) {
             $q->the_post();
-            $id     = get_the_ID();
-            $number = (int) get_post_meta($id, '_episode_number', true);
-            $season = (int) get_post_meta($id, '_season_number', true);
-            $date   = get_post_meta($id, '_episode_date', true) ?: get_the_date('Y-m-d');
-            $mp3    = get_post_meta($id, '_mp3_file', true);
-            $label  = ($season ? 'S' . $season . ' ' : '') . 'Episode ' . $number;
-            $out .= '<article class="podcast-episode">'
-                . '<h3 class="podcast-episode-title"><a href="' . esc_url(get_permalink()) . '">' . esc_html(get_the_title()) . '</a></h3>'
-                . '<p class="podcast-episode-meta">' . esc_html($label) . ' &middot; ' . esc_html(mysql2date(get_option('date_format'), $date)) . '</p>';
-            if ($yes($a['excerpt'])) {
-                $out .= '<div class="podcast-episode-excerpt">' . wp_kses_post(wpautop(get_the_excerpt())) . '</div>';
-            }
-            if ($yes($a['player']) && $mp3) {
-                $out .= wp_audio_shortcode(['src' => $mp3, 'preload' => 'none']);
-            }
-            $out .= '</article>';
+            $out .= self::render_episode_item($yes($a['excerpt']), $yes($a['player']));
         }
         wp_reset_postdata();
         $out .= '</div>';
@@ -92,19 +83,186 @@ class PodcastingManager {
         return $out;
     }
 
-    /** Show an audio player at the top of a single episode page. */
-    public function prepend_player($content) {
-        if (!is_singular('podcast') || !in_the_loop() || !is_main_query()) return $content;
-        $url = get_post_meta(get_the_ID(), '_mp3_file', true);
-        $transcript = get_post_meta(get_the_ID(), '_transcript', true);
-        $before = $url ? '<div class="podcast-player">' . wp_audio_shortcode(['src' => $url, 'preload' => 'none']) . '</div>' : '';
-        $after = $transcript ? '<details class="podcast-transcript"><summary>Transcript</summary>' . wpautop(wp_kses_post($transcript)) . '</details>' : '';
-        return $before . $content . $after;
+    /** HTML for one episode in a listing. Call inside the loop (current post = the episode). */
+    public static function render_episode_item($show_excerpt = true, $show_player = false) {
+        $id     = get_the_ID();
+        $number = (int) get_post_meta($id, '_episode_number', true);
+        $season = (int) get_post_meta($id, '_season_number', true);
+        $date   = get_post_meta($id, '_episode_date', true) ?: get_the_date('Y-m-d');
+        $mp3    = get_post_meta($id, '_mp3_file', true);
+        $label  = ($season ? 'S' . $season . ' ' : '') . 'Episode ' . $number;
+        $out = '<article class="podcast-episode">'
+            . '<h3 class="podcast-episode-title"><a href="' . esc_url(get_permalink()) . '">' . esc_html(get_the_title()) . '</a></h3>'
+            . '<p class="podcast-episode-meta">' . esc_html($label) . ' &middot; ' . esc_html(mysql2date(get_option('date_format'), $date)) . '</p>';
+        if ($show_excerpt) {
+            $out .= '<div class="podcast-episode-excerpt">' . wp_kses_post(wpautop(get_the_excerpt())) . '</div>';
+        }
+        if ($show_player && $mp3 && !post_password_required()) {
+            $out .= wp_audio_shortcode(['src' => $mp3, 'preload' => 'none']);
+        }
+        return $out . '</article>';
     }
 
-    /** Add /podcast/{episode number}/ rewrite rule (runs after post type registration). */
+    /** Order/filter the native /podcast/ archive by episode number. */
+    public function archive_query($query) {
+        if (is_admin() || !$query->is_main_query() || !$query->is_post_type_archive('podcast')) return;
+        $meta_query = [
+            'relation' => 'AND',
+            'number'   => ['key' => '_episode_number', 'type' => 'NUMERIC', 'compare' => 'EXISTS'],
+        ];
+        $season = isset($_GET['season']) ? trim((string) $_GET['season']) : '';
+        if ($season !== '' && ctype_digit($season)) {
+            $meta_query[] = ['key' => '_season_number', 'value' => (int) $season, 'type' => 'NUMERIC'];
+        }
+        $existing = $query->get('meta_query');
+        if (is_array($existing) && $existing) {
+            $meta_query[] = $existing; // keep other plugins' clauses (with their relation) as a nested group
+        }
+        $query->set('meta_query', $meta_query);
+        $query->set('orderby', 'number');
+        $query->set('order', 'DESC');
+        $query->set('posts_per_page', (int) apply_filters('podcast_archive_per_page', 10));
+    }
+
+    /** Use the theme's archive-podcast.php if it has one, otherwise the plugin's. */
+    public function archive_template($template) {
+        if (is_post_type_archive('podcast') && basename($template) !== 'archive-podcast.php') {
+            return __DIR__ . '/templates/archive-podcast.php';
+        }
+        return $template;
+    }
+
+    /** Flush rewrite rules whenever the archive's path or on/off state changes (slug edit, Page created/renamed/removed). */
+    public function maybe_flush_rewrite() {
+        $state = $this->archive_slug() . '|' . ($this->archive_conflicting_page() ? 'off' : 'on') . '|feed-alias|ep:' . $this->episode_base();
+        if (get_option('podcast_archive_state') !== $state) {
+            update_option('podcast_archive_state', $state);
+            flush_rewrite_rules();
+        }
+    }
+
+    private function clean_archive_slug($value) {
+        $slug = is_string($value) ? sanitize_title($value) : '';
+        return ($slug === '' || in_array($slug, PodcastingManagerOptions::reserved_slugs(), true)) ? 'podcast' : $slug;
+    }
+
+    public function archive_slug() {
+        return $this->clean_archive_slug(get_option('podcast_archive_slug', 'podcast'));
+    }
+
+    /** A published Page already living at the archive slug (the archive rule would override it). */
+    public function archive_conflicting_page() {
+        static $cache = [];
+        $slug = $this->archive_slug();
+        if (!array_key_exists($slug, $cache)) {
+            $page = get_page_by_path($slug); // uncached query, so memoize it per request
+            $cache[$slug] = ($page && $page->post_status === 'publish') ? $page : null;
+        }
+        return $cache[$slug];
+    }
+
+    /**
+     * Breadcrumb trail for the archive and single episodes: Home > Podcast > Episode.
+     * Accessible <nav> plus schema.org BreadcrumbList JSON-LD. Turn off in settings or with the
+     * `podcast_show_breadcrumbs` filter (e.g. if an SEO plugin already prints breadcrumbs).
+     */
+    public static function breadcrumbs() {
+        if (get_option('podcast_breadcrumbs', '1') !== '1' || !apply_filters('podcast_show_breadcrumbs', true)) return '';
+
+        $archive = get_post_type_archive_link('podcast');
+        $label   = apply_filters('podcast_breadcrumb_label', 'Podcasts');
+        $crumbs  = [['Home', home_url('/')]];
+        if (is_singular('podcast')) {
+            if ($archive) $crumbs[] = [$label, $archive];
+            $crumbs[] = [get_the_title(), ''];
+        } elseif (is_post_type_archive('podcast')) {
+            $crumbs[] = [$label, ''];
+        } else {
+            return '';
+        }
+
+        static $css_done = false;
+        $out = '';
+        if (!$css_done) {
+            $css_done = true;
+            // Specific enough to beat theme rules like `.entry-content ol li` / `.entry-content ol a` (the trail sits inside post content on episode pages).
+            $out .= '<style>'
+                . 'nav.podcast-breadcrumbs ol{list-style:none;margin:0 0 1em;padding:0;display:flex;flex-wrap:wrap;gap:.4em;font-size:.9em}'
+                . 'nav.podcast-breadcrumbs ol li{list-style:none;margin:0;padding:0}'
+                . 'nav.podcast-breadcrumbs ol li:not(:last-child)::after{content:"\\203A";margin-left:.4em;opacity:.6}'
+                . 'nav.podcast-breadcrumbs ol a{color:inherit;text-decoration:none}'
+                . 'nav.podcast-breadcrumbs ol a:hover{text-decoration:underline}'
+                . '</style>';
+        }
+        $out .= '<nav class="podcast-breadcrumbs" aria-label="Breadcrumb"><ol>';
+        $ld = [];
+        foreach ($crumbs as $i => [$name, $url]) {
+            $last = $i === count($crumbs) - 1;
+            $out .= '<li' . ($last ? ' aria-current="page"' : '') . '>'
+                . ($url && !$last ? '<a href="' . esc_url($url) . '">' . esc_html($name) . '</a>' : esc_html($name)) . '</li>';
+            $item = ['@type' => 'ListItem', 'position' => $i + 1, 'name' => wp_strip_all_tags($name)];
+            if ($url) $item['item'] = $url;
+            elseif ($last && is_singular('podcast')) $item['item'] = get_permalink();
+            $ld[] = $item;
+        }
+        $out .= '</ol></nav>';
+        $out .= '<script type="application/ld+json">' . wp_json_encode(
+            ['@context' => 'https://schema.org', '@type' => 'BreadcrumbList', 'itemListElement' => $ld],
+            JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP
+        ) . '</script>';
+        return $out;
+    }
+
+    private static $crumbs_printed = false;
+
+    /**
+     * Classic themes: print the trail where the archive prints it, just before the episode markup
+     * (not inside .entry-content, where themes restyle lists and links). Block themes can't print
+     * here safely, so they fall back to the_content below.
+     */
+    public function breadcrumbs_before_loop($query) {
+        if (self::$crumbs_printed || !$query->is_main_query() || !is_singular('podcast')) return;
+        if (function_exists('wp_is_block_theme') && wp_is_block_theme()) return;
+        $html = self::breadcrumbs();
+        if ($html === '') return;
+        self::$crumbs_printed = true;
+        echo $html; // phpcs:ignore WordPress.Security.EscapeOutput -- escaped in breadcrumbs()
+    }
+
+    /** Show an audio player (and video, when set) at the top of a single episode page. */
+    public function prepend_player($content) {
+        if (!is_singular('podcast') || !in_the_loop() || !is_main_query()) return $content;
+        $crumbs = self::$crumbs_printed ? '' : self::breadcrumbs();
+        if (post_password_required()) return $crumbs . $content; // don't leak audio/transcript around the password form
+        $url = get_post_meta(get_the_ID(), '_mp3_file', true);
+        $video = get_post_meta(get_the_ID(), '_video_url', true);
+        $transcript = get_post_meta(get_the_ID(), '_transcript', true);
+        $before = $url ? '<div class="podcast-player">' . wp_audio_shortcode(['src' => $url, 'preload' => 'none']) . '</div>' : '';
+        if ($video) {
+            $embed = wp_oembed_get($video, ['width' => 640]);
+            if (!$embed) {
+                $embed = '<a href="' . esc_url($video) . '" target="_blank" rel="noopener">Watch the video</a>';
+            }
+            $before .= '<div class="podcast-video">' . $embed . '</div>';
+        }
+        $after = $transcript ? '<details class="podcast-transcript"><summary>Transcript</summary>' . wpautop(wp_kses_post($transcript)) . '</details>' : '';
+        return $crumbs . $before . $content . $after;
+    }
+
+    /**
+     * URL base for single episodes and /{n}/ number URLs. Deliberately independent of the
+     * archive slug so episode links stay stable when the archive path changes.
+     */
+    public function episode_base() {
+        $base = apply_filters('podcast_episode_base', 'podcast');
+        return is_string($base) && $base !== '' ? sanitize_title($base) : 'podcast';
+    }
+
+    /** Add /{base}/{episode number}/ rewrite rule (runs after post type registration). */
     public function add_episode_rewrite() {
-        add_rewrite_rule('^podcast/([0-9]+)/?$', 'index.php?post_type=podcast&episode_number=$matches[1]', 'top');
+        add_rewrite_rule('^' . preg_quote($this->episode_base(), '#') . '/([0-9]+)/?$', 'index.php?post_type=podcast&episode_number=$matches[1]', 'top');
+        // {archive}/feed/ serves the podcast (iTunes / Podcasting 2.0) feed instead of WordPress's generic RSS.
+        add_rewrite_rule('^' . preg_quote($this->archive_slug(), '#') . '/feed/?$', 'index.php?feed=podcast', 'top');
     }
 
     public function query_by_episode_number($query) {
@@ -114,6 +272,13 @@ class PodcastingManager {
         $query->set('post_type', 'podcast');
         $query->set('meta_query', [['key' => '_episode_number', 'value' => $number, 'type' => 'NUMERIC']]);
         $query->set('posts_per_page', 1);
+        // Several episodes can share a number (numbering restarts each season); the oldest one owns /podcast/{n}/.
+        $query->set('orderby', 'ID');
+        $query->set('order', 'ASC');
+        // WP skips LIMIT for queries flagged singular, so enforce it or every duplicate renders on the page.
+        add_filter('post_limits', function ($limits, $q) use ($query) {
+            return $q === $query ? 'LIMIT 1' : $limits;
+        }, 10, 2);
         $query->is_singular = true;
         $query->is_single = true;
         $query->is_archive = false;
@@ -121,10 +286,36 @@ class PodcastingManager {
         $query->is_home = false;
     }
 
+    private static $number_owners = null;
+
+    /** episode number => ID of the published episode that owns /podcast/{n}/ (lowest ID). One query per request. */
+    private function number_owners() {
+        if (self::$number_owners === null) {
+            global $wpdb;
+            $rows = $wpdb->get_results(
+                "SELECT CAST(m.meta_value AS UNSIGNED) AS n, MIN(p.ID) AS id
+                 FROM {$wpdb->postmeta} m JOIN {$wpdb->posts} p ON p.ID = m.post_id
+                 WHERE m.meta_key = '_episode_number' AND p.post_type = 'podcast' AND p.post_status = 'publish'
+                 GROUP BY n"
+            );
+            self::$number_owners = [];
+            foreach ((array) $rows as $r) self::$number_owners[(int) $r->n] = (int) $r->id;
+        }
+        return self::$number_owners;
+    }
+
     public function episode_permalink($link, $post) {
-        if ($post->post_type !== 'podcast' || get_option('permalink_structure') === '') return $link;
+        if ($post->post_type !== 'podcast' || !get_option('permalink_structure')) return $link;
         $number = (int) get_post_meta($post->ID, '_episode_number', true);
-        return $number ? home_url('/podcast/' . $number . '/') : $link;
+        if (!$number) return $link;
+        $owner = $this->number_owners()[$number] ?? 0;
+        // Use /podcast/{n}/ only for the episode that owns the number; a duplicate keeps its slug URL so both stay reachable.
+        if ($owner && $owner !== (int) $post->ID) return $link;
+        return home_url('/' . $this->episode_base() . '/' . $number . '/');
+    }
+
+    public function reset_number_owners() {
+        self::$number_owners = null;
     }
 
     public function add_admin_menu() {
@@ -158,8 +349,11 @@ class PodcastingManager {
             'podcast_current_season' => fn($v) => trim((string) $v) === '' ? '' : absint($v),
             'podcast_default_episode_hosts' => 'sanitize_text_field',
             'podcast_autonumber' => fn($v) => $v ? '1' : '',
-            'podcast_default_transcript_type' => 'sanitize_text_field',
+            'podcast_default_transcript_type' => fn($v) => is_string($v) && isset(PodcastingManagerOptions::transcript_types()[$v]) ? $v : 'text/html',
             'podcast_feed_limit' => fn($v) => max(1, min(300, (int) $v)),
+            'podcast_archive_player' => fn($v) => $v ? '1' : '',
+            'podcast_breadcrumbs' => fn($v) => $v ? '1' : '',
+            'podcast_archive_slug' => fn($v) => $this->clean_archive_slug($v),
         ];
 
         foreach ($settings as $setting => $callback) {
@@ -202,6 +396,9 @@ class PodcastingManager {
         ?>
         <div class="wrap">
             <h1>Podcast Settings</h1>
+            <?php if ($page = $this->archive_conflicting_page()) : ?>
+                <div class="notice notice-warning"><p>The episode archive is off because the page <a href="<?php echo esc_url(get_edit_post_link($page->ID)); ?>"><?php echo esc_html(get_the_title($page)); ?></a> already uses <code>/<?php echo esc_html($this->archive_slug()); ?>/</code>. Rename or unpublish that page, or change the Archive URL below, to enable it.</p></div>
+            <?php endif; ?>
             <p>Podcast feed: <a href="<?php echo esc_url(PodcastingManagerFeed::get_feed_url()); ?>" target="_blank"><code><?php echo esc_html(PodcastingManagerFeed::get_feed_url()); ?></code></a>
                 &middot; <a href="https://podba.se/validate/?url=<?php echo rawurlencode(PodcastingManagerFeed::get_feed_url()); ?>" target="_blank">Validate</a></p>
             <form method="post" action="options.php">
@@ -258,8 +455,11 @@ class PodcastingManager {
                     $this->row('podcast_default_episode_hosts', 'Default Episode Host(s)', 'Comma-separated. Pre-fills the Hosts field on new episodes.', 'text', [], get_option('podcast_hosts'));
                     $this->row('podcast_autonumber', 'Auto-number Episodes', 'Pre-fill new episodes with the next episode number.', 'checkbox', [], '1');
                     $this->row('podcast_default_transcript_type', 'Transcript Format', 'File format of the transcripts you link to on episodes.', 'select',
-                        ['text/html' => 'HTML', 'text/plain' => 'Plain text', 'application/srt' => 'SRT', 'text/vtt' => 'WebVTT', 'application/json' => 'JSON'], 'text/html');
+                        PodcastingManagerOptions::transcript_types(), 'text/html');
                     $this->row('podcast_feed_limit', 'Episodes in Feed', 'How many of your newest episodes the feed includes (1-300).', 'number', [], 20);
+                    $this->row('podcast_archive_slug', 'Archive URL', 'Where the episode listing page lives, e.g. "podcast" gives /podcast/.', 'text', [], 'podcast');
+                    $this->row('podcast_archive_player', 'Player on Archive', 'Show an audio player for each episode on the archive page.', 'checkbox', [], '1');
+                    $this->row('podcast_breadcrumbs', 'Breadcrumbs', 'Show a Home > Podcast > Episode trail on the archive and episode pages (with search-engine structured data). Turn off if your theme or SEO plugin already adds breadcrumbs.', 'checkbox', [], '1');
                     ?>
                 </table>
 
@@ -285,13 +485,14 @@ class PodcastingManager {
         $this->add_episode_rewrite();
         register_post_type('podcast', [
             'public' => true,
+            'has_archive' => $this->archive_conflicting_page() ? false : $this->archive_slug(),
             'label'  => 'Podcasts',
             'labels' => [
                 'singular_name' => 'Podcast',
                 'add_new_item' => 'Add New Podcast',
             ],
             'supports' => ['title', 'editor', 'thumbnail', 'excerpt', 'custom-fields'],
-            'rewrite' => ['slug' => 'podcast', 'with_front' => false],
+            'rewrite' => ['slug' => $this->episode_base(), 'with_front' => false],
             'show_in_graphql' => true,
             'graphql_single_name' => 'podcast',
             'graphql_plural_name' => 'podcasts',
@@ -308,6 +509,7 @@ class PodcastingManager {
         $fields = [
             'episode_number' => 'Episode Number',
             'mp3_file' => 'MP3 URL',
+            'video_url' => 'Video URL (YouTube, etc.)',
             'episode_date' => 'Episode Date',
             'episode_length' => 'Length (seconds)',
             'file_size' => 'File Size (bytes)',
@@ -317,6 +519,7 @@ class PodcastingManager {
             'chapters_url' => 'Chapters URL (JSON)',
             'episode_hosts' => 'Hosts (comma-separated)',
             'episode_guests' => 'Guests (comma-separated)',
+            'transcript_type' => 'Transcript URL format',
         ];
         $is_new = $post->post_status === 'auto-draft';
         $defaults = [];
@@ -339,7 +542,25 @@ class PodcastingManager {
                     'tinymce' => ['content_style' => 'body.mce-content-body{padding:10px!important;margin:0!important;max-width:none!important;min-height:0!important}']]);
                 continue;
             }
-            $class = $field === 'episode_date' ? 'widefat podcast-datepicker' : 'widefat';
+            if ($field === 'transcript_type') {
+                echo "<p><label for='transcript_type'>" . esc_html($label) . "</label><br><select name='transcript_type' id='transcript_type'>";
+                echo "<option value=''>Use default (" . esc_html(PodcastingManagerOptions::transcript_types()[get_option('podcast_default_transcript_type', 'text/html')] ?? 'HTML') . ")</option>";
+                foreach (PodcastingManagerOptions::transcript_types() as $mime => $label_t) {
+                    printf("<option value='%s'%s>%s</option>", esc_attr($mime), selected($value, $mime, false), esc_html($label_t));
+                }
+                echo "</select></p>";
+                continue;
+            }
+            if ($field === 'episode_date') {
+                echo "<p><label for='episode_date'>" . esc_html($label) . "</label><br>
+                <input type='date' class='widefat' name='episode_date' id='episode_date' value='" . esc_attr($value) . "'></p>";
+                continue;
+            }
+            if ($field === 'video_url') {
+                echo "<p><label for='video_url'>" . esc_html($label) . " (shown with the player on the episode page)</label><br>
+                <input type='url' class='widefat' name='video_url' id='video_url' value='" . esc_attr($value) . "' placeholder='https://www.youtube.com/watch?v=...'></p>";
+                continue;
+            }
             if ($field === 'mp3_file') {
                 echo "<p><label for='mp3_file'>" . esc_html($label) . "</label><br>
                 <input type='url' class='widefat' name='mp3_file' id='mp3_file' value='" . esc_attr($value) . "' placeholder='Paste a URL or upload a file'>
@@ -350,25 +571,31 @@ class PodcastingManager {
                 continue;
             }
             echo "<p><label for='$field'>" . esc_html($label) . "</label><br>
-            <input type='text' class='$class' name='$field' id='$field' value='".esc_attr($value)."'></p>";
+            <input type='text' class='widefat' name='$field' id='$field' value='".esc_attr($value)."'></p>";
         }
     }
 
     public function save_meta_box_data($post_id) {
-        if (!isset($_POST['podcast_episode_meta_nonce']) || !wp_verify_nonce($_POST['podcast_episode_meta_nonce'], 'podcast_episode_meta')) return;
+        $nonce = isset($_POST['podcast_episode_meta_nonce']) ? sanitize_text_field(wp_unslash($_POST['podcast_episode_meta_nonce'])) : '';
+        if (!$nonce || !wp_verify_nonce($nonce, 'podcast_episode_meta')) return;
         if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+        if (wp_is_post_revision($post_id) || get_post_type($post_id) !== 'podcast') return;
         if (!current_user_can('edit_post', $post_id)) return;
 
+        $transcript_types = PodcastingManagerOptions::transcript_types();
         $fields = ['episode_number' => 'intval', 'mp3_file' => 'esc_url_raw',
+                   'video_url' => 'esc_url_raw',
                    'episode_date' => 'sanitize_text_field', 'episode_length' => 'intval',
                    'file_size' => 'intval', 'transcript' => 'wp_kses_post',
                    'season_number' => 'intval', 'episode_hosts' => 'sanitize_text_field', 'transcript_url' => 'esc_url_raw',
-                   'chapters_url' => 'esc_url_raw', 'episode_guests' => 'sanitize_text_field'];
+                   'chapters_url' => 'esc_url_raw', 'episode_guests' => 'sanitize_text_field',
+                   'transcript_type' => fn($v) => isset($transcript_types[$v]) ? $v : ''];
 
         foreach ($fields as $field => $cb) {
-            if (isset($_POST[$field])) {
-                update_post_meta($post_id, "_$field", call_user_func($fields[$field], $_POST[$field]));
-            }
+            if (!isset($_POST[$field]) || !is_string($_POST[$field])) continue;
+            // $_POST is slashed: unslash before sanitizing, re-slash for update_post_meta (which unslashes).
+            $clean = call_user_func($cb, wp_unslash($_POST[$field]));
+            update_post_meta($post_id, "_$field", wp_slash($clean));
         }
 
         // Attached audio: remember the attachment and fill size/length if blank.
@@ -386,6 +613,18 @@ class PodcastingManager {
             }
         } else {
             delete_post_meta($post_id, '_mp3_attachment_id');
+        }
+
+        // Remote audio with no known size: ask the server once so the feed enclosure has a length.
+        // Stored on the episode, so this runs at most once per save until it succeeds.
+        if ($mp3 && !get_post_meta($post_id, '_file_size', true) && !get_post_meta($post_id, '_mp3_attachment_id', true)
+            && apply_filters('podcast_fetch_remote_file_size', true)
+        ) {
+            $head = wp_remote_head($mp3, ['timeout' => 5, 'redirection' => 3]);
+            $len = is_wp_error($head) ? 0 : (int) wp_remote_retrieve_header($head, 'content-length');
+            if ($len > 0) {
+                update_post_meta($post_id, '_file_size', $len);
+            }
         }
     }
 
@@ -446,46 +685,57 @@ class PodcastingManager {
             }
         ]);
 
+        // Number/season/date stay public (the archive listing shows them for protected episodes too).
+        // Everything content-carrying is gated so a post password hides it from the API as well as the page and feed.
+        $open  = fn($key, $cast) => fn($post) => $cast(get_post_meta($post->ID, $key, true));
+        $gated = fn($key, $cast) => fn($post) => post_password_required($post->ID) ? null : $cast(get_post_meta($post->ID, $key, true));
+        $str = fn($v) => (string) $v;
+        $int = fn($v) => (int) $v;
+
         register_graphql_fields('podcast', [
             'episodeNumber' => [
                 'type' => 'Int',
-                'resolve' => fn($post) => (int)get_post_meta($post->ID, '_episode_number', true),
+                'resolve' => $open('_episode_number', $int),
             ],
             'mp3File' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_mp3_file', true),
+                'resolve' => $gated('_mp3_file', $str),
+            ],
+            'videoUrl' => [
+                'type' => 'String',
+                'resolve' => $gated('_video_url', $str),
             ],
             'episodeDate' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_episode_date', true),
+                'resolve' => $open('_episode_date', $str),
             ],
             'episodeLength' => [
                 'type' => 'Int',
-                'resolve' => fn($post) => (int)get_post_meta($post->ID, '_episode_length', true),
+                'resolve' => $gated('_episode_length', $int),
             ],
             'fileSize' => [
                 'type' => 'Int',
-                'resolve' => fn($post) => (int)get_post_meta($post->ID, '_file_size', true),
+                'resolve' => $gated('_file_size', $int),
             ],
             'transcript' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_transcript', true),
+                'resolve' => $gated('_transcript', $str),
             ],
             'seasonNumber' => [
                 'type' => 'Int',
-                'resolve' => fn($post) => (int)get_post_meta($post->ID, '_season_number', true),
+                'resolve' => $open('_season_number', $int),
             ],
             'transcriptUrl' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_transcript_url', true),
+                'resolve' => $gated('_transcript_url', $str),
             ],
             'chaptersUrl' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_chapters_url', true),
+                'resolve' => $gated('_chapters_url', $str),
             ],
             'guests' => [
                 'type' => 'String',
-                'resolve' => fn($post) => get_post_meta($post->ID, '_episode_guests', true),
+                'resolve' => $gated('_episode_guests', $str),
             ],
         ]);
     }
@@ -523,7 +773,7 @@ JS);
         if (!in_array($hook, ['post.php', 'post-new.php'])) return;
         if (get_post_type() === 'podcast') {
             wp_enqueue_media();
-            wp_add_inline_script('jquery-ui-datepicker', <<<'JS'
+            wp_add_inline_script('jquery', <<<'JS'
 jQuery(function ($) {
     var frame;
     $('#podcast-upload-audio').on('click', function (e) {
@@ -544,18 +794,21 @@ jQuery(function ($) {
 });
 JS);
         }
-        wp_enqueue_script('jquery-ui-datepicker');
-        wp_enqueue_style('jquery-ui', '//code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css');
-        wp_add_inline_script('jquery-ui-datepicker', 'jQuery(".podcast-datepicker").datepicker({dateFormat: "yy-mm-dd"});');
+    }
+
+    /**
+     * Activation: register the feed and post type, then flush so their rules
+     * exist immediately (a named method so tests can run it).
+     */
+    public static function activate() {
+        (new PodcastingManagerFeed())->register_feed();
+        (new PodcastingManager())->register_post_type();
+        flush_rewrite_rules();
     }
 
 }
 
 new PodcastingManager();
 
-register_activation_hook(__FILE__, function () {
-    (new PodcastingManagerFeed())->register_feed();
-    (new PodcastingManager())->register_post_type();
-    flush_rewrite_rules();
-});
+register_activation_hook(__FILE__, ['PodcastingManager', 'activate']);
 register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
