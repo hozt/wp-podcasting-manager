@@ -31,6 +31,9 @@ jobs:
       - name: Install WordPress test core
         run: bash tests/bin/install-wordpress.sh
 
+      - name: Create test database
+        run: mysql --host 127.0.0.1 --port 3306 --user=root --password=root -e 'CREATE DATABASE IF NOT EXISTS wordpress_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;'
+
       - name: Run PHPUnit
         run: vendor/bin/phpunit
         env:
